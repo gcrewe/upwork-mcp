@@ -1,5 +1,7 @@
 """Profile and connects tools for Upwork MCP."""
 
+import asyncio
+import re
 from ..browser.client import get_browser
 
 
@@ -13,59 +15,87 @@ async def get_my_profile() -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto("https://www.upwork.com/freelancers/settings/profile", wait_until="networkidle")
+    # The old code scraped the *settings* page (h1 == "Settings"). The public
+    # profile lives at an id-based URL (/freelancers/~<hash>) that redirects to
+    # the username slug; locate that link from the settings left nav.
+    await page.goto("https://www.upwork.com/freelancers/settings/profile", wait_until="domcontentloaded")
+    await asyncio.sleep(2.5)
+    profile_url = await page.evaluate("""
+    (() => {
+      const links = Array.from(document.querySelectorAll('a'));
+      const l = links.find(a => /\\/freelancers\\/~[A-Za-z0-9]+$/.test(a.href));
+      return l ? l.href : null;
+    })()
+    """)
+    if not profile_url:
+        profile_url = "https://www.upwork.com/freelancers/settings/profile"
 
-    profile = {}
+    await page.goto(profile_url, wait_until="domcontentloaded")
+    await asyncio.sleep(3)
 
-    # Name
-    name_el = await page.query_selector('[data-test="profile-name"], h1, .profile-name')
-    if name_el:
-        profile["name"] = (await name_el.text_content() or "").strip()
+    profile: dict = {}
 
-    # Professional title
-    title_el = await page.query_selector('[data-test="profile-title"], .profile-title, [data-cy="title"]')
-    if title_el:
-        profile["title"] = (await title_el.text_content() or "").strip()
+    h1 = await page.query_selector("h1")
+    if h1:
+        profile["name"] = (await h1.text_content() or "").strip()
 
-    # Hourly rate
-    rate_el = await page.query_selector('[data-test="hourly-rate"], .hourly-rate, [data-cy="rate"]')
-    if rate_el:
-        profile["hourly_rate"] = (await rate_el.text_content() or "").strip()
+    text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
 
-    # Profile overview/bio
-    overview_el = await page.query_selector('[data-test="profile-overview"], .profile-overview, [data-cy="overview"]')
-    if overview_el:
-        profile["overview"] = (await overview_el.text_content() or "").strip()
+    # Title + hourly rate typically render as "<Title>\n$<rate>/hr"
+    m = re.search(r"([A-Z][^\n|]{2,60})\n\s*\$([\d.,]+)/hr", text)
+    if m:
+        profile["title"] = m.group(1).strip()
+        profile["hourly_rate"] = f"${m.group(2)}/hr"
+    else:
+        doc_title = await page.title()
+        m2 = re.match(r"^[^-]+\s*-\s*([^|]+?)\s*\|\s*Upwork", doc_title)
+        if m2:
+            profile["title"] = m2.group(1).strip()
 
-    # Skills
-    skill_els = await page.query_selector_all('[data-test="skill"], .skill-badge, .air3-token')
-    profile["skills"] = []
+    # Overview: the paragraph that follows the rate (until Portfolio/Work history)
+    m = re.search(r"\$[\d.,]+/hr\n\n(.{20,700}?)\n\n(?:Portfolio|Work history|Skills|Certifications)", text, re.S)
+    if m:
+        profile["overview"] = re.sub(r"\n{2,}", "\n", m.group(1)).strip()
+
+    # Skills: Upwork renders each tag inside [class*="skill"] elements
+    skill_els = await page.query_selector_all('[class*="skill"]')
+    seen: list[str] = []
     for el in skill_els:
-        text = await el.text_content()
-        if text:
-            profile["skills"].append(text.strip())
+        t = (await el.text_content() or "").strip()
+        if not t or len(t) > 40:
+            continue
+        if re.fullmatch(r"(Skills|Self-reported)", t, re.I):
+            continue
+        if "self-reported" in t.lower() or "\n" in t or "skills" in t.lower():
+            continue
+        if t not in seen:
+            seen.append(t)
+    if seen:
+        profile["skills"] = seen[:25]
 
-    # Now get stats from a different page
-    await page.goto("https://www.upwork.com/nx/find-work/best-matches", wait_until="networkidle")
+    # Connects (also fetched from the hub as a fallback)
+    m = re.search(r"Connects:\s*(\d+)", text)
+    if m:
+        profile["connects"] = {"available": int(m.group(1))}
+    else:
+        profile["connects"] = await get_connects_balance()
 
-    # Try to get JSS from sidebar or header
-    jss_el = await page.query_selector('[data-test="jss"], .jss-score, [data-cy="jss"]')
-    if jss_el:
-        profile["job_success_score"] = (await jss_el.text_content() or "").strip()
+    # Location / availability / JSS (best effort)
+    m = re.search(r"([A-Z][A-Za-z ,\-–]+?–\s*[\d:apm ]+local time)", text)
+    if m:
+        profile["location"] = m.group(1).strip()
 
-    # Availability badge
-    avail_el = await page.query_selector('[data-test="availability"], .availability-badge')
-    if avail_el:
-        profile["availability"] = (await avail_el.text_content() or "").strip()
+    m = re.search(r"\b(Open for work|Available for work|Not available)\b", text, re.I)
+    if m:
+        profile["availability"] = m.group(1).strip()
 
-    # Profile completeness
-    complete_el = await page.query_selector('[data-test="profile-completeness"], .profile-complete')
-    if complete_el:
-        profile["profile_completeness"] = (await complete_el.text_content() or "").strip()
+    m = re.search(r"Job Success[^\n]{0,30}", text)
+    if m:
+        profile["job_success_score"] = m.group(0).strip()
 
-    # Get connects balance
-    connects = await get_connects_balance()
-    profile["connects"] = connects
+    m = re.search(r"\b(English|Spanish):\s*([^\n]{1,40})", text)
+    if m:
+        profile["languages"] = [(m.group(1), m.group(2).strip())]
 
     return profile
 
@@ -80,48 +110,21 @@ async def get_connects_balance() -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    # Navigate to connects page (redirects to the Connects Hub)
-    await page.goto("https://www.upwork.com/nx/plans/connects", wait_until="networkidle")
+    # /nx/plans/connects redirects to the Connects Hub; balance is the number
+    # next to the "Balance" label in the summary card.
+    await page.goto("https://www.upwork.com/nx/plans/connects", wait_until="domcontentloaded")
+    await asyncio.sleep(3)
 
-    connects = {}
-    import re
+    text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
+    connects: dict = {}
 
-    # Connects Hub: balance summary block (e.g. "Balance 100  Buy Connects")
-    available_el = await page.query_selector('.connects-balance-summary')
-    if available_el:
-        text = (await available_el.text_content() or "").replace(",", "").strip()
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            connects["available"] = int(numbers[0])
+    m = re.search(r"Balance\s+([\d,]+)", text)
+    if m:
+        connects["available"] = int(m.group(1).replace(",", ""))
 
-    # Old selectors (kept for resilience)
-    if "available" not in connects:
-        available_el = await page.query_selector('[data-test="connects-available"], .connects-balance, [data-cy="available-connects"]')
-        if available_el:
-            text = (await available_el.text_content() or "").replace(",", "").strip()
-            numbers = re.findall(r'\d+', text)
-            if numbers:
-                connects["available"] = int(numbers[0])
-
-    # If we couldn't find it, try the header/sidebar on main page
-    if "available" not in connects:
-        await page.goto("https://www.upwork.com/nx/find-work/", wait_until="networkidle")
-        connects_el = await page.query_selector('[data-test="connects-count"], .connects-count')
-        if connects_el:
-            text = (await connects_el.text_content() or "").replace(",", "").strip()
-            import re
-            numbers = re.findall(r'\d+', text)
-            if numbers:
-                connects["available"] = int(numbers[0])
-
-    # Try to get additional connects info
-    pending_el = await page.query_selector('[data-test="pending-connects"]')
-    if pending_el:
-        text = (await pending_el.text_content() or "").strip()
-        import re
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            connects["pending"] = int(numbers[0])
+    m = re.search(r"Pending\s+([\d,]+)", text)
+    if m:
+        connects["pending"] = int(m.group(1).replace(",", ""))
 
     return connects
 
@@ -135,29 +138,22 @@ async def get_profile_stats() -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    # Navigate to work diary or stats page
-    await page.goto("https://www.upwork.com/nx/wm/contracts", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/nx/wm/contracts", wait_until="domcontentloaded")
+    await asyncio.sleep(3.5)
 
-    stats = {}
+    text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
+    stats: dict = {}
 
-    # Total earnings
-    earnings_el = await page.query_selector('[data-test="total-earnings"], .earnings-total')
-    if earnings_el:
-        stats["total_earnings"] = (await earnings_el.text_content() or "").strip()
+    m = re.search(r"(?:Total billings|Earnings)[^\n:]*[:$\n]{1,3}\s*\$?([\d.,]+[KMB]?)", text, re.I)
+    if m:
+        stats["total_earnings"] = m.group(0).strip()
 
-    # Active contracts count
-    active_el = await page.query_selector('[data-test="active-contracts"], .active-count')
-    if active_el:
-        stats["active_contracts"] = (await active_el.text_content() or "").strip()
+    m = re.search(r"(\d+)\s*\n?\s*(active contracts|active contract)", text, re.I)
+    if m:
+        stats["active_contracts"] = int(m.group(1))
 
-    # Total hours
-    hours_el = await page.query_selector('[data-test="total-hours"], .hours-total')
-    if hours_el:
-        stats["total_hours"] = (await hours_el.text_content() or "").strip()
-
-    # Jobs completed
-    jobs_el = await page.query_selector('[data-test="jobs-completed"], .jobs-count')
-    if jobs_el:
-        stats["jobs_completed"] = (await jobs_el.text_content() or "").strip()
+    m = re.search(r"(\d+)\s*\n?\s*(hours logged|total hours)", text, re.I)
+    if m:
+        stats["total_hours"] = int(m.group(1))
 
     return stats
