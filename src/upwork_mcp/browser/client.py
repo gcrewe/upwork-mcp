@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 import os
+import sys
 from pathlib import Path
 from typing import Any
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -59,11 +60,14 @@ def start_chrome_with_debug() -> bool:
         stderr=subprocess.DEVNULL,
     )
 
-    # Wait for Chrome to start
+    # Wait for Chrome to start (time.sleep: this may be called from a running
+    # event loop, where run_until_complete would raise RuntimeError)
+    import time
+
     for _ in range(10):
         if is_chrome_running_with_debug():
             return True
-        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.5))
+        time.sleep(0.5)
 
     return is_chrome_running_with_debug()
 
@@ -87,7 +91,7 @@ class UpworkBrowser:
 
         # Ensure Chrome is running with debug port
         if not is_chrome_running_with_debug():
-            print("Starting Chrome with debug port...")
+            print("Starting Chrome with debug port...", file=sys.stderr)
             if not start_chrome_with_debug():
                 raise RuntimeError(
                     f"Could not start Chrome. Please start it manually with:\n"
@@ -148,7 +152,7 @@ class UpworkBrowser:
 
             # Check for Cloudflare (still showing)
             if "moment" in title.lower():
-                print("Cloudflare challenge detected. Please solve it in the browser window.")
+                print("Cloudflare challenge detected. Please solve it in the browser window.", file=sys.stderr)
                 return False
 
             # Check for login redirect
@@ -157,7 +161,7 @@ class UpworkBrowser:
 
             return True
         except Exception as e:
-            print(f"Login check error: {e}")
+            print(f"Login check error: {e}", file=sys.stderr)
             return False
 
     async def ensure_logged_in(self) -> bool:

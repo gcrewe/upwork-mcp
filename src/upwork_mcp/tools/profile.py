@@ -80,27 +80,35 @@ async def get_connects_balance() -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    # Navigate to connects page
-    await page.goto("https://www.upwork.com/nx/plans/connects/balance", wait_until="networkidle")
+    # Navigate to connects page (redirects to the Connects Hub)
+    await page.goto("https://www.upwork.com/nx/plans/connects", wait_until="networkidle")
 
     connects = {}
+    import re
 
-    # Available connects
-    available_el = await page.query_selector('[data-test="connects-available"], .connects-balance, [data-cy="available-connects"]')
+    # Connects Hub: balance summary block (e.g. "Balance 100  Buy Connects")
+    available_el = await page.query_selector('.connects-balance-summary')
     if available_el:
-        text = (await available_el.text_content() or "").strip()
-        # Extract number
-        import re
+        text = (await available_el.text_content() or "").replace(",", "").strip()
         numbers = re.findall(r'\d+', text)
         if numbers:
             connects["available"] = int(numbers[0])
+
+    # Old selectors (kept for resilience)
+    if "available" not in connects:
+        available_el = await page.query_selector('[data-test="connects-available"], .connects-balance, [data-cy="available-connects"]')
+        if available_el:
+            text = (await available_el.text_content() or "").replace(",", "").strip()
+            numbers = re.findall(r'\d+', text)
+            if numbers:
+                connects["available"] = int(numbers[0])
 
     # If we couldn't find it, try the header/sidebar on main page
     if "available" not in connects:
         await page.goto("https://www.upwork.com/nx/find-work/", wait_until="networkidle")
         connects_el = await page.query_selector('[data-test="connects-count"], .connects-count')
         if connects_el:
-            text = (await connects_el.text_content() or "").strip()
+            text = (await connects_el.text_content() or "").replace(",", "").strip()
             import re
             numbers = re.findall(r'\d+', text)
             if numbers:
