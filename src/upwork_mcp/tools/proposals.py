@@ -22,6 +22,10 @@ class SubmitProposalParams(BaseModel):
     rate: float | None = Field(default=None, description="Proposed hourly rate (for hourly jobs)")
     bid: float | None = Field(default=None, description="Bid amount (for fixed-price jobs)")
     answers: list[str] | None = Field(default=None, description="Answers to screening questions")
+    project_duration: str | None = Field(
+        default=None,
+        description='Project duration for fixed-price forms (e.g. "3 to 6 months"). Defaults to "3 to 6 months".',
+    )
 
 
 # Rows in the new proposals UI live inside tables.up-proposals-list__block, one
@@ -221,6 +225,70 @@ async def _set_rate_increase(page) -> bool:
     return ok1 and ok2
 
 
+async def _set_project_duration(page, duration: str) -> bool:
+    """Set the 'How long will this project take?' selector on fixed-price forms."""
+    opened = await page.evaluate("""
+    (() => {
+      const toggles = Array.from(document.querySelectorAll('.air3-dropdown-toggle')).filter(e => e.offsetParent);
+      const t = toggles.find(x => /duration/i.test((x.innerText || '')) || /\bSelect a\b/i.test((x.innerText || '')));
+      if (!t) return false;
+      t.click();
+      return true;
+    })()
+    """)
+    if not opened:
+        return False
+    await page.wait_for_timeout(600)
+    picked = await page.evaluate("""
+    (target) => {
+      const items = Array.from(document.querySelectorAll('li, button, [role="option"], a'))
+        .filter(e => e.offsetParent && (e.innerText || '').trim() === target);
+      const el = items[items.length - 1];
+      if (!el) return false;
+      const b = el.getBoundingClientRect();
+      return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+    }
+    """, duration)
+    if not picked:
+        await page.keyboard.press("Escape")
+        return False
+    await page.mouse.click(picked["x"], picked["y"])
+    await page.wait_for_timeout(900)
+    return True
+
+
+async def _confirm_fixed_price_dialog(page) -> None:
+    """Dismiss Upwork's fixed-price confirmation dialog after the CTA click:
+    acknowledge 'Yes, I understand' if present, then click Continue."""
+    try:
+        await page.wait_for_timeout(2500)
+        body = await page.evaluate("document.body ? document.body.innerText : ''") or ""
+        if "you're submitting for a fixed-price project" not in body.lower():
+            return
+        await page.evaluate("""
+        (() => {
+          const els = Array.from(document.querySelectorAll('label, button, a, [role=checkbox], [role=button], [class*=checkbox]')).filter(e => e.offsetParent);
+          const hit = els.find(e => /yes, i understand/i.test((e.innerText || '').trim()));
+          if (hit) hit.click();
+        })()
+        """)
+        await page.wait_for_timeout(1200)
+        cont = await page.evaluate("""
+        (() => {
+          const btns = Array.from(document.querySelectorAll('button')).filter(e => e.offsetParent);
+          const c = btns.find(b => /^continue$/i.test((b.innerText || '').trim()));
+          if (!c || c.disabled) return null;
+          const r = c.getBoundingClientRect();
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        })()
+        """)
+        if cont:
+            await page.mouse.click(cont["x"], cont["y"])
+            await page.wait_for_timeout(5000)
+    except Exception:
+        pass
+
+
 async def submit_proposal(params: SubmitProposalParams) -> dict:
     """Submit a proposal to an Upwork job.
 
@@ -272,9 +340,24 @@ async def submit_proposal(params: SubmitProposalParams) -> dict:
                 return {"status": "error", "message": "Hourly rate input not found on apply form"}
 
     if params.bid is not None:
-        if not await _set_native_value(page, "[data-test='currency-input']", str(params.bid)):
-            if not await _set_native_value(page, "input[name*='bid'], input[name*='amount']", str(params.bid)):
-                return {"status": "error", "message": "Bid input not found on apply form"}
+        # Fixed-price apply forms render a payment-terms step: "By milestone"
+        # (one or more milestone rows) or "By project" (single total). The
+        # "By project" total field is #charged-amount-id; milestone amounts
+        # live in #milestone-amount-N.
+        await page.evaluate("""
+        (() => {
+          const labels = Array.from(document.querySelectorAll('label, [role=radio], [class*="option"]')).filter(e => e.offsetParent);
+          const byproj = labels.find(l => /By project/i.test(l.innerText || ''));
+          if (byproj) byproj.click();
+        })()
+        """)
+        await asyncio.sleep(1.2)
+        bid_ok = await _set_native_value(page, "#charged-amount-id", str(params.bid))
+        if not bid_ok:
+            bid_ok = await _set_native_value(page, "#milestone-amount-1", str(params.bid))
+        if not bid_ok:
+            return {"status": "error", "message": "Bid/payment amount input not found on apply form"}
+        await _set_project_duration(page, params.project_duration or "3 to 6 months")
 
     # --- Fill cover letter (the visible textarea on the apply page) ---
     letter_el = None
@@ -323,28 +406,38 @@ async def submit_proposal(params: SubmitProposalParams) -> dict:
         except Exception:
             pass
 
-    # --- Submit ---
+    # --- Submit (CTA is either "Submit proposal" or the dynamic "Send for N Connects") ---
     submitted = await page.evaluate("""
-    (() => {
+    (pattern) => {
+      const re = new RegExp(pattern);
       const btns = Array.from(document.querySelectorAll('button')).filter(e => e.offsetParent);
-      const b = btns.find(x => (x.innerText || '').trim().toLowerCase() === 'submit proposal');
+      const b = btns.find(x => re.test((x.innerText || '').trim().toLowerCase()));
       if (b) { b.click(); return true; }
       return false;
-    })()
-    """)
+    }
+    """, r"^(submit proposal|submit for \d+ connects|send for \d+ connects)")
     if not submitted:
         return {"status": "error", "message": "Submit button not found on apply form"}
 
-    await asyncio.sleep(6)
+    # Fixed-price jobs open a confirmation dialog ("Yes, I understand" -> Continue)
+    await _confirm_fixed_price_dialog(page)
+    await asyncio.sleep(4)
     body = await page.evaluate("document.body ? document.body.innerText : ''") or ""
 
     if re.search(r"fix the errors below", body, re.I):
+        err_msgs = await page.evaluate("""
+        (() => Array.from(document.querySelectorAll('.air3-form-message-error, [class*="error"]'))
+               .filter(e => e.offsetParent)
+               .map(e => (e.innerText || '').trim().replace(/\\n+/g, ' '))
+               .filter(Boolean).slice(0, 10))()
+        """)
         return {
             "status": "error",
-            "message": "Form validation errors on apply page — check rate, cover letter, and required fields (incl. rate increase schedule).",
+            "message": "Form validation errors on apply page",
+            "errors": err_msgs,
         }
 
-    if re.search(r"(proposal|proposals).{0,30}(submitted|sent)", body, re.I) or "proposals/active" in page.url:
+    if re.search(r"(proposal|proposals).{0,30}(submitted|sent)", body, re.I) or "proposals/active" in page.url or "success" in page.url.lower():
         return {"status": "submitted", "connects_used": connects_required, "message": "Proposal submitted successfully"}
 
     return {"status": "unknown", "message": "Could not confirm submission status", "connects_required": connects_required}
