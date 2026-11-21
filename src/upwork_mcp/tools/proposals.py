@@ -227,34 +227,53 @@ async def _set_rate_increase(page) -> bool:
 
 async def _set_project_duration(page, duration: str) -> bool:
     """Set the 'How long will this project take?' selector on fixed-price forms."""
-    opened = await page.evaluate("""
-    (() => {
-      const toggles = Array.from(document.querySelectorAll('.air3-dropdown-toggle')).filter(e => e.offsetParent);
-      const t = toggles.find(x => /duration/i.test((x.innerText || '')) || /\bSelect a\b/i.test((x.innerText || '')));
-      if (!t) return false;
-      t.click();
-      return true;
-    })()
-    """)
-    if not opened:
-        return False
-    await page.wait_for_timeout(600)
-    picked = await page.evaluate("""
-    (target) => {
-      const items = Array.from(document.querySelectorAll('li, button, [role="option"], a'))
-        .filter(e => e.offsetParent && (e.innerText || '').trim() === target);
-      const el = items[items.length - 1];
-      if (!el) return false;
-      const b = el.getBoundingClientRect();
-      return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
-    }
-    """, duration)
-    if not picked:
-        await page.keyboard.press("Escape")
-        return False
-    await page.mouse.click(picked["x"], picked["y"])
-    await page.wait_for_timeout(900)
-    return True
+    for attempt in range(2):
+        opened = await page.evaluate("""
+        (() => {
+          const toggles = Array.from(document.querySelectorAll('.air3-dropdown-toggle')).filter(e => e.offsetParent);
+          // Prefer a toggle whose text mentions duration; fall back to the
+          // first unselected-looking toggle near a "How long" label.
+          const t = toggles.find(x => /duration/i.test((x.innerText || '')))
+                    or toggles.find(x => /\bselect a\b/i.test((x.innerText || '')))
+                    or toggles[0];
+          if (!t) return false;
+          t.click();
+          return true;
+        })()
+        """)
+        if not opened:
+            return False
+        await page.wait_for_timeout(700)
+
+        picked = await page.evaluate("""
+        (target) => {
+          // click the item inside the currently-open menu only
+          const menu = Array.from(document.querySelectorAll(
+            '[class*="dropdown-menu"] [class*="menu-list"], [class*="dropdown-content"], [role="listbox"]'
+          )).find(m => m.offsetParent && /More than 6 months|3 to 6 months|Less than 1 month/.test(m.innerText || ''));
+          const scope = menu || document;
+          const items = Array.from(scope.querySelectorAll('li, button, [role="option"], a'))
+            .filter(e => e.offsetParent && (e.innerText || '').trim() === target);
+          const el = items[items.length - 1];
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+        """, duration)
+        if not picked:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(400)
+            continue
+        await page.mouse.click(picked["x"], picked["y"])
+        await page.wait_for_timeout(1100)
+        # verify the selection registered
+        now = await page.evaluate("""
+        (() => Array.from(document.querySelectorAll('.air3-dropdown-toggle'))
+              .filter(e => e.offsetParent).map(t => (t.innerText || '').trim()).join(' | '))()
+        """)
+        if duration.lower() in now.lower():
+            return True
+    return False
 
 
 async def _confirm_fixed_price_dialog(page) -> None:
